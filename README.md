@@ -18,13 +18,14 @@ docker compose -f orgs/octave-commons/eros-eris-field-app/compose.yaml up
 
 Defaults assume:
 - GraphQL: `http://127.0.0.1:8796/graphql`
-- Ollama: `http://127.0.0.1:11434`
+- embeddings endpoint: `http://127.0.0.1:11434`
 
 ## Env (high signal)
 
 - `GRAPHQL_URL` (default: `http://127.0.0.1:8796/graphql`)
 - `GRAPHQL_ADMIN_TOKEN` (optional) – forwarded as `Authorization: Bearer ...`
-- `OLLAMA_URL` (default: `http://127.0.0.1:11434`)
+- `OLLAMA_URL` (default: `http://127.0.0.1:11434`) – any Ollama-compatible `/api/embeddings` endpoint, including Proxx native embeddings mode
+- `OLLAMA_AUTH_TOKEN` (optional) – bearer token for authenticated embedding gateways such as Proxx
 - `OLLAMA_MODEL` (default: `qwen3-embedding:0.6b`)
 
 - `SIM_MAX_NODES` (default: `6000`)

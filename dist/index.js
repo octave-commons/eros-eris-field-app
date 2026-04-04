@@ -108,7 +108,10 @@ async function ollamaEmbedOne(params) {
     try {
         const res = await fetch(`${params.ollamaUrl}/api/embeddings`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: {
+                "content-type": "application/json",
+                ...(params.ollamaAuthToken ? { authorization: `Bearer ${params.ollamaAuthToken}` } : {}),
+            },
             body: JSON.stringify({ model: params.model, prompt: params.text, input: params.text }),
             signal: ac.signal,
         });
@@ -178,6 +181,7 @@ async function main() {
     const graphqlUrl = str("GRAPHQL_URL", "http://127.0.0.1:8796/graphql");
     const adminToken = String(process.env.GRAPHQL_ADMIN_TOKEN || "").trim() || null;
     const ollamaUrl = str("OLLAMA_URL", "http://127.0.0.1:11434");
+    const ollamaAuthToken = String(process.env.OLLAMA_AUTH_TOKEN || "").trim() || null;
     const ollamaModel = str("OLLAMA_MODEL", "qwen3-embedding:0.6b");
     const simMaxNodes = Math.floor(num("SIM_MAX_NODES", 6000));
     const simMaxEdges = Math.floor(num("SIM_MAX_EDGES", 12000));
@@ -298,6 +302,7 @@ async function main() {
                     try {
                         const vec = await ollamaEmbedOne({
                             ollamaUrl,
+                            ollamaAuthToken,
                             model: ollamaModel,
                             text: doc,
                             timeoutMs: 60_000,
