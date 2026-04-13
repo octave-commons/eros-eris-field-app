@@ -10,6 +10,9 @@ Myth name rationale:
 - **Eros** pulls similar things together
 - **Eris** pushes dissimilar things apart
 
+
+> Built with [GLM-5](https://z.ai) — part of the [z.ai](https://z.ai) startup ecosystem and the [Ussyverse](https://ussy.cloud).
+
 ## Run (docker)
 
 ```bash
