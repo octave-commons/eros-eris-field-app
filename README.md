@@ -10,9 +10,6 @@ Myth name rationale:
 - **Eros** pulls similar things together
 - **Eris** pushes dissimilar things apart
 
-
-> Built with [GLM-5](https://z.ai) — part of the [z.ai](https://z.ai) startup ecosystem and the [Ussyverse](https://ussy.cloud).
-
 ## Run (docker)
 
 ```bash
@@ -30,6 +27,12 @@ Defaults assume:
 - `OLLAMA_URL` (default: `http://127.0.0.1:11434`) – any Ollama-compatible `/api/embeddings` endpoint, including Proxx native embeddings mode
 - `OLLAMA_AUTH_TOKEN` (optional) – bearer token for authenticated embedding gateways such as Proxx
 - `OLLAMA_MODEL` (default: `qwen3-embedding:0.6b`)
+- `VEXX_BASE_URL` (optional) – if set, semantic edge scoring offloads cosine matrix work to `vexx`
+- `VEXX_API_KEY` (optional) – bearer token for authenticated `vexx`
+- `VEXX_DEVICE` (default: `AUTO`) – `AUTO|CPU|GPU|NPU`
+- `VEXX_REQUIRE_ACCEL` (default: `false`) – fail rather than fall back when accel is requested
+- `VEXX_MIN_CANDIDATES` (default: `64`) – only offload when enough peer embeddings exist to amortize the HTTP round-trip
+- `VEXX_TIMEOUT_MS` (default: `30000`) – cosine scoring timeout for `vexx` requests
 
 - `SIM_MAX_NODES` (default: `6000`)
 - `SIM_MAX_EDGES` (default: `12000`)
