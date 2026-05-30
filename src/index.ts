@@ -1,11 +1,14 @@
 import {
   buildSemanticEdgesForCandidates,
   stepField,
+  GraphAntSystem,
   type FieldConfig,
   type Particle,
   type SemanticEdge,
   type SpringEdge,
   type VexxCosineConfig,
+  type GraphAntConfig,
+  type AntTrailEdge,
 } from "@workspace/eros-eris-field";
 
 type GraphViewNode = {
@@ -98,11 +101,20 @@ function parseJson(maybe: string | null): any {
 
 function inferLake(node: GraphViewNode): string {
   const data = parseJson(node.dataJson);
-  return String(data?.lake || node.id.split(":", 1)[0] || "misc");
+  const id = node.id;
+  if (id.startsWith("knoxx-session:")) return "knoxx-session";
+  return String(data?.lake || id.split(":", 1)[0] || "misc");
 }
 
 function inferNodeType(node: GraphViewNode): string {
   const data = parseJson(node.dataJson);
+  const id = node.id;
+  if (id.startsWith("knoxx-session:")) {
+    if (id.includes(":tool_call:") || id.includes(":tool-call:")) return "tool_call";
+    if (id.includes(":tool_result:") || id.includes(":tool-result:")) return "tool_result";
+    if (id.includes(":reasoning:")) return "reasoning";
+    if (id.includes(":message:")) return "message";
+  }
   return String(data?.node_type || node.kind || "node");
 }
 
@@ -111,6 +123,17 @@ function lakeCenterX(lake: string): number {
     case "devel": return -1400;
     case "web": return 0;
     case "bluesky": return 1400;
+    case "knoxx-session": return 0;
+    default: return 0;
+  }
+}
+
+function lakeCenterY(lake: string): number {
+  switch (lake) {
+    case "devel": return 0;
+    case "web": return 0;
+    case "bluesky": return 0;
+    case "knoxx-session": return 2400;
     default: return 0;
   }
 }
@@ -130,6 +153,13 @@ function typeBandY(lake: string, nodeType: string): number {
     if (nodeType === "user") return -180;
     if (nodeType === "post") return 180;
   }
+  if (lake === "knoxx-session") {
+    if (nodeType === "message") return -800;
+    if (nodeType === "reasoning") return -400;
+    if (nodeType === "tool_call") return 0;
+    if (nodeType === "tool_result") return 400;
+    return -200;
+  }
   return 0;
 }
 
@@ -138,15 +168,15 @@ function applyLakeBands(params: {
   nodesById: Map<string, { lake: string; nodeType: string }>;
   dt: number;
 }): void {
-  const xStrength = 0.018;
-  const yStrength = 0.012;
+  const xStrength = 0.004;
+  const yStrength = 0.0025;
 
   for (const particle of params.particles) {
     const meta = params.nodesById.get(particle.id);
     if (!meta) continue;
 
     const targetX = lakeCenterX(meta.lake);
-    const targetY = typeBandY(meta.lake, meta.nodeType);
+    const targetY = lakeCenterY(meta.lake) + typeBandY(meta.lake, meta.nodeType);
 
     particle.vx += (targetX - particle.x) * xStrength * params.dt;
     particle.vy += (targetY - particle.y) * yStrength * params.dt;
@@ -204,6 +234,50 @@ async function fetchGraphView(params: {
   return data.graphView;
 }
 
+async function fetchOpenPlannerGraphView(params: {
+  openPlannerBaseUrl: string;
+  openPlannerApiKey: string | null;
+  maxNodes: number;
+  maxEdges: number;
+  componentCount: number;
+  shardIndex: number;
+  shardCount: number;
+  rotationCursor: number;
+}): Promise<GraphView> {
+  const baseUrl = String(params.openPlannerBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl) {
+    throw new Error("openplanner base url required");
+  }
+
+  const res = await fetch(`${baseUrl}/v1/graph/view`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(params.openPlannerApiKey ? { authorization: `Bearer ${params.openPlannerApiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      maxNodes: params.maxNodes,
+      maxEdges: params.maxEdges,
+      componentCount: params.componentCount,
+      shardIndex: params.shardIndex,
+      shardCount: params.shardCount,
+      rotationCursor: params.rotationCursor,
+    }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`openplanner graph view ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  const payload = JSON.parse(text) as { nodes?: GraphViewNode[]; edges?: GraphViewEdge[]; meta?: GraphView["meta"] };
+  return {
+    nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
+    edges: Array.isArray(payload.edges) ? payload.edges : [],
+    meta: payload.meta ?? { totalNodes: 0, totalEdges: 0, sampledNodes: false, sampledEdges: false },
+  };
+}
+
 async function fetchNodePreview(params: {
   graphqlUrl: string;
   adminToken: string | null;
@@ -244,6 +318,28 @@ async function layoutUpsertPositions(params: {
   adminToken: string | null;
   inputs: Array<{ id: string; x: number; y: number }>;
 }): Promise<number> {
+  const graphWeaverBaseUrl = params.graphqlUrl.replace(/\/graphql\/?$/, "");
+
+  try {
+    const response = await fetch(`${graphWeaverBaseUrl}/api/layout/upsert`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(params.adminToken ? { authorization: `Bearer ${params.adminToken}` } : {}),
+      },
+      body: JSON.stringify({ inputs: params.inputs }),
+    });
+
+    const text = await response.text();
+    if (response.ok) {
+      const payload = JSON.parse(text) as { updated?: number };
+      if (typeof payload.updated === "number") return payload.updated;
+      return params.inputs.length;
+    }
+  } catch {
+    // Fall back to GraphQL for older graph-weaver builds.
+  }
+
   const data = await gql<{ layoutUpsertPositions: number }>({
     url: params.graphqlUrl,
     adminToken: params.adminToken,
@@ -397,6 +493,93 @@ async function upsertOpenPlannerSemanticEdges(params: {
   return payload.stored ?? 0;
 }
 
+type CanonicalEdge = {
+  source: string;
+  target: string;
+  similarity: number;
+  edgeType: string;
+  graphVersion: string | null;
+};
+
+type CanonicalEdgesResponse = {
+  ok: boolean;
+  count: number;
+  edges: CanonicalEdge[];
+};
+
+type StructuralEdgeResponse = {
+  edges: Array<{
+    source: string;
+    target: string;
+    edgeKind: string;
+    layer?: string | null;
+    data?: unknown;
+  }>;
+};
+
+async function fetchCanonicalSemanticEdges(params: {
+  openPlannerBaseUrl: string;
+  openPlannerApiKey: string | null;
+  nodeIds: Set<string>;
+  limit?: number;
+}): Promise<SemanticEdge[]> {
+  const baseUrl = String(params.openPlannerBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl) return [];
+
+  const limit = Math.max(1, Math.min(100000, params.limit ?? 50000));
+  const url = `${baseUrl}/v1/graph/semantic-edges?limit=${limit}`;
+
+  const res = await fetch(url, {
+    headers: {
+      ...(params.openPlannerApiKey ? { authorization: `Bearer ${params.openPlannerApiKey}` } : {}),
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`canonical semantic edges ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  }
+
+  const payload = (await res.json()) as CanonicalEdgesResponse;
+  return payload.edges
+    .filter((e) => params.nodeIds.has(e.source) && params.nodeIds.has(e.target))
+    .map((e) => ({ a: e.source, b: e.target, sim: e.similarity }));
+}
+
+async function fetchOpenPlannerStructuralEdges(params: {
+  openPlannerBaseUrl: string;
+  openPlannerApiKey: string | null;
+  nodeIds: string[];
+  limit?: number;
+}): Promise<GraphViewEdge[]> {
+  const baseUrl = String(params.openPlannerBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl || params.nodeIds.length === 0) return [];
+
+  const res = await fetch(`${baseUrl}/v1/graph/edges/query`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(params.openPlannerApiKey ? { authorization: `Bearer ${params.openPlannerApiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      nodeIds: params.nodeIds,
+      limit: Math.max(1, Math.min(50000, params.limit ?? 50000)),
+    }),
+  });
+
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`openplanner structural edges ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  const payload = JSON.parse(text) as StructuralEdgeResponse;
+  return (Array.isArray(payload.edges) ? payload.edges : []).map((edge) => ({
+    source: edge.source,
+    target: edge.target,
+    kind: edge.edgeKind,
+    dataJson: edge.data ? JSON.stringify(edge.data) : null,
+  }));
+}
+
 async function upsertOpenPlannerEdges(params: {
   openPlannerBaseUrl: string;
   openPlannerApiKey: string | null;
@@ -449,6 +632,10 @@ function springProfile(kind: string): { strength: number; restLength: number } {
     case "post_links_visited_web":
     case "post_links_unvisited_web":
       return { strength: 0.003, restLength: 220 };
+    case "mentions_devel_path":
+      return { strength: 0.0015, restLength: 320 };
+    case "mentions_web_url":
+      return { strength: 0.0015, restLength: 320 };
     default:
       return { strength: 0.002, restLength: 150 };
   }
@@ -559,13 +746,14 @@ function summarizeField(params: {
 }
 
 async function main(): Promise<void> {
+  const workerRole = str("EROS_ERIS_WORKER_ROLE", "hybrid").toLowerCase();
   const graphqlUrl = str("GRAPHQL_URL", "http://127.0.0.1:8796/graphql");
   const adminToken = String(process.env.GRAPHQL_ADMIN_TOKEN || "").trim() || null;
   const openPlannerBaseUrl = String(process.env.OPENPLANNER_BASE_URL || "").trim();
   const openPlannerApiKey = String(process.env.OPENPLANNER_API_KEY || "").trim() || null;
 
   // Embedding model for OpenPlanner materialization (OpenPlanner owns all embedding generation)
-  const embeddingModel = str("OLLAMA_MODEL", "qwen3-embedding:0.6b");
+  const embeddingModel = str("EMBED_PROVIDER_MODEL", "qwen3-embedding:0.6b");
   const embedContentMode = str("EMBED_CONTENT_MODE", "full").toLowerCase();
   const vexxBaseUrl = String(process.env.VEXX_BASE_URL || "").trim();
   const vexxApiKey = String(process.env.VEXX_API_KEY || "").trim() || undefined;
@@ -601,11 +789,32 @@ async function main(): Promise<void> {
   const embedMaxInFlight = Math.max(1, Math.min(8, Math.floor(num("EMBED_MAX_IN_FLIGHT", 4))));
   const embedPreviewMaxBytes = Math.floor(num("EMBED_PREVIEW_MAX_BYTES", 40000));
   const embedMaxChars = Math.floor(num("EMBED_MAX_CHARS", 6000));
+  const hydrateVisibleEmbeddings = !/^(0|false|no|off)$/i.test(String(process.env.HYDRATE_VISIBLE_EMBEDDINGS || "true"));
+  const hydrateBatchSize = Math.max(64, Math.min(2000, Math.floor(num("HYDRATE_BATCH_SIZE", 1000))));
+  const hydrateMaxBatchesPerRefresh = Math.max(1, Math.min(16, Math.floor(num("HYDRATE_MAX_BATCHES_PER_REFRESH", 4))));
 
   const semanticAttractAbove = clamp(num("SEMANTIC_ATTRACT_ABOVE", 0.72), -1, 1);
   const semanticRepelBelow = clamp(num("SEMANTIC_REPEL_BELOW", 0.08), -1, 1);
+  const semanticSpatialOptimization = !/^(0|false|no|off)$/i.test(String(process.env.SEMANTIC_SPATIAL_OPTIMIZATION || "true"));
+  const semanticMaxPeersPerCandidate = Math.max(32, Math.min(2048, Math.floor(num("SEMANTIC_MAX_PEERS_PER_CANDIDATE", 192))));
   const edgePullScale = num("EDGE_PULL_SCALE", 3.2);
   const edgeRestScale = clamp(num("EDGE_REST_SCALE", 0.84), 0.2, 2);
+  const useCanonicalGraph = /^(1|true|yes|on)$/i.test(String(process.env.USE_CANONICAL_GRAPH || ""));
+  const canonicalGraphRefreshMs = Math.max(1000, Math.floor(num("CANONICAL_GRAPH_REFRESH_MS", workerRole === "structural" ? 30000 : 300000)));
+  const openPlannerStructuralEdgeLimit = Math.max(1000, Math.min(200000, Math.floor(num("OPENPLANNER_STRUCTURAL_EDGE_LIMIT", 50000))));
+  const graphViewComponentCount = Math.max(1, Math.min(16, Math.floor(num("GRAPH_VIEW_COMPONENT_COUNT", 6))));
+  const simShardCount = Math.max(1, Math.min(64, Math.floor(num("SIM_SHARD_COUNT", 1))));
+  const simShardIndex = ((Math.floor(num("SIM_SHARD_INDEX", 0)) % simShardCount) + simShardCount) % simShardCount;
+  const graphViewRotationEvery = Math.max(1, Math.min(32, Math.floor(num("GRAPH_VIEW_ROTATION_EVERY", 2))));
+  const refreshPhaseOffsetMs = Math.floor((simShardIndex * refreshMs) / Math.max(1, simShardCount));
+  const writePhaseOffsetMs = Math.floor((simShardIndex * writeMs) / Math.max(1, simShardCount));
+  const enableSimulation = workerRole !== "semantic";
+  const enableLayoutWrites = workerRole !== "semantic";
+  const enableSemanticPipeline = workerRole !== "structural";
+  const enableVisibleEmbeddingHydration = enableSemanticPipeline && hydrateVisibleEmbeddings;
+  const enableStructuralEdgeHydration = workerRole !== "semantic";
+  const enableStructuralEdgeUpsert = workerRole !== "semantic";
+  const enableCanonicalGraphRefresh = workerRole === "structural" && useCanonicalGraph;
 
   const fieldConfig: FieldConfig = {
     theta: clamp(num("BH_THETA", 0.8), 0.2, 1.6),
@@ -618,6 +827,7 @@ async function main(): Promise<void> {
     maxSpeed: num("MAX_SPEED", 120),
     minSeparation: num("MIN_SEPARATION", 18),
     separationStrength: num("SEPARATION", 2600),
+    structuralClusterStrength: num("STRUCTURAL_CLUSTER", 0.02),
 
     semanticAttractAbove,
     semanticRepelBelow,
@@ -626,9 +836,9 @@ async function main(): Promise<void> {
     semanticRepelRadius: num("SEMANTIC_REPEL_RADIUS", 150),
     semanticRestLength: num("SEMANTIC_REST", 56),
 
-    targetRadius: num("TARGET_RADIUS", 5000),
+    targetRadius: num("TARGET_RADIUS", 7000),
 
-    boundaryThickness: num("BOUNDARY_THICKNESS", 650),
+    boundaryThickness: num("BOUNDARY_THICKNESS", 900),
     boundaryPressure: num("BOUNDARY_PRESSURE", 60),
     boundaryEdgeFraction: clamp(num("BOUNDARY_EDGE_FRACTION", 0.04), 0.01, 0.5),
   };
@@ -637,24 +847,45 @@ async function main(): Promise<void> {
   const particlesById = new Map<string, Particle>();
   const nodeMetaById = new Map<string, { lake: string; nodeType: string }>();
   let springs: SpringEdge[] = [];
+  let antTrailEdges: SpringEdge[] = [];
   let currentViewNodes: GraphViewNode[] = [];
   let currentDegrees = new Map<string, number>();
+  let refreshInFlight: Promise<void> | null = null;
+  let writeInFlight: Promise<void> | null = null;
 
-  // embeddings + semantic edges
   const embeddings = new Map<string, number[]>();
   const semanticPairs = new Map<string, SemanticEdge>();
 
-  let lastRefresh = 0;
-  let lastWrite = 0;
+  const enableAntSystem = !/^(0|false|no)$/i.test(String(process.env.EROS_ERIS_ANT_SYSTEM ?? "true"));
+  const antSystem = enableAntSystem
+    ? new GraphAntSystem({
+        antCount: Math.max(1, Math.floor(num("ANT_COUNT", 16))),
+        stepsPerTick: Math.max(1, Math.floor(num("ANT_STEPS_PER_TICK", 8))),
+        depositRate: num("ANT_DEPOSIT_RATE", 0.35),
+        evaporationRate: num("ANT_EVAPORATION_RATE", 0.02),
+        alpha: num("ANT_ALPHA", 1.2),
+        beta: num("ANT_BETA", 3.0),
+        revisitPenalty: num("ANT_REVISIT_PENALTY", 0.3),
+        forceScale: num("ANT_FORCE_SCALE", 0.06),
+        maxPheromone: num("ANT_MAX_PHEROMONE", 8),
+      })
+    : null;
+
+  let lastRefresh = Date.now() - refreshMs + refreshPhaseOffsetMs;
+  let lastWrite = Date.now() - writeMs + writePhaseOffsetMs;
   let lastEmbed = 0;
+  let lastCanonicalGraph = 0;
+  let currentCanonicalGraphVersion: string | null = null;
+  let graphViewRefreshCount = 0;
 
   // Background embed pipeline state
   const embedInFlight = new Set<Promise<void>>();
   const claimedEmbeddingIds = new Set<string>();
+  let hydrateInFlight: Promise<void> | null = null;
 
   // eslint-disable-next-line no-console
   console.log(
-    `[eros-eris] starting · graphql=${graphqlUrl} · openplanner=${openPlannerBaseUrl || "off"} · embeddingModel=${embeddingModel} · vexx=${vexxBaseUrl || "off"} device=${vexx?.device ?? "local"} · writeMs=${writeMs} chunk=${writeChunk} pause=${writePauseMs} · embedEveryMs=${embedEveryMs} batch=${embedBatchSize} inFlight=${embedMaxInFlight}`,
+    `[eros-eris] starting · role=${workerRole} · graphql=${graphqlUrl} · openplanner=${openPlannerBaseUrl || "off"} · embeddingModel=${embeddingModel} · vexx=${vexxBaseUrl || "off"} device=${vexx?.device ?? "local"} · shard=${simShardIndex}/${simShardCount} rotationEvery=${graphViewRotationEvery} components=${graphViewComponentCount} refreshPhase=${refreshPhaseOffsetMs}ms writePhase=${writePhaseOffsetMs}ms · writeMs=${writeMs} chunk=${writeChunk} pause=${writePauseMs} · embedEveryMs=${embedEveryMs} batch=${embedBatchSize} inFlight=${embedMaxInFlight}`,
   );
 
   // Background embed worker - runs independently of main loop
@@ -662,8 +893,18 @@ async function main(): Promise<void> {
     if (batch.length === 0) return;
     const embedMs = timings?.embedMs ?? 0;
     const fresh = batch.map((b) => ({ id: b.id, vec: b.vec }));
-    const existingPeers = [...embeddings.entries()].map(([id, embedding]) => ({ id, embedding }));
-    const freshPeers = fresh.map((r) => ({ id: r.id, embedding: r.vec }));
+    const existingPeers = [...embeddings.entries()].map(([id, embedding]) => ({
+      id,
+      embedding,
+      x: particlesById.get(id)?.x,
+      y: particlesById.get(id)?.y,
+    }));
+    const freshPeers = fresh.map((r) => ({
+      id: r.id,
+      embedding: r.vec,
+      x: particlesById.get(r.id)?.x,
+      y: particlesById.get(r.id)?.y,
+    }));
 
     const semanticStart = Date.now();
     const semanticEdges = await buildSemanticEdgesForCandidates({
@@ -674,6 +915,8 @@ async function main(): Promise<void> {
         repelBelow: semanticRepelBelow,
         topK: Math.floor(num("SEMANTIC_TOP_K", 24)),
         bottomK: Math.floor(num("SEMANTIC_BOTTOM_K", 2)),
+        useSpatialOptimization: semanticSpatialOptimization,
+        maxPeersPerCandidate: semanticMaxPeersPerCandidate,
         vexx,
       },
     });
@@ -716,104 +959,196 @@ async function main(): Promise<void> {
   for (;;) {
     const now = Date.now();
 
-    if (now - lastRefresh >= refreshMs) {
-      const viewStart = Date.now();
-      const view = await fetchGraphView({
-        graphqlUrl,
-        adminToken,
-        maxNodes: simMaxNodes,
-        maxEdges: simMaxEdges,
-      });
-      const viewMs = Date.now() - viewStart;
+    if (now - lastRefresh >= refreshMs && !refreshInFlight) {
+      refreshInFlight = (async () => {
+        const refreshStartedAt = Date.now();
+        const viewStart = Date.now();
+        const rotationCursor = Math.floor(graphViewRefreshCount / graphViewRotationEvery);
+        const view = openPlannerBaseUrl
+          ? await fetchOpenPlannerGraphView({
+              openPlannerBaseUrl,
+              openPlannerApiKey,
+              maxNodes: simMaxNodes,
+              maxEdges: simMaxEdges,
+              componentCount: graphViewComponentCount,
+              shardIndex: simShardIndex,
+              shardCount: simShardCount,
+              rotationCursor,
+            })
+          : await fetchGraphView({
+              graphqlUrl,
+              adminToken,
+              maxNodes: simMaxNodes,
+              maxEdges: simMaxEdges,
+            });
+        const viewMs = Date.now() - viewStart;
 
-      const present = new Set<string>();
-      for (const n of view.nodes) {
-        present.add(n.id);
-        nodeMetaById.set(n.id, { lake: inferLake(n), nodeType: inferNodeType(n) });
-        const p = particlesById.get(n.id);
-        if (!p) {
-          const created = { id: n.id, x: n.x, y: n.y, vx: 0, vy: 0, mass: 1 } satisfies Particle;
-          nudgeInsideBoundary(created, fieldConfig.targetRadius, fieldConfig.boundaryThickness);
-          particlesById.set(n.id, created);
-        } else {
-          // If node just arrived (or was reset), snap gently toward the current view position.
-          p.x = Number.isFinite(p.x) ? p.x : n.x;
-          p.y = Number.isFinite(p.y) ? p.y : n.y;
+        const present = new Set<string>();
+        for (const n of view.nodes) {
+          present.add(n.id);
+          nodeMetaById.set(n.id, { lake: inferLake(n), nodeType: inferNodeType(n) });
+          const p = particlesById.get(n.id);
+          if (!p) {
+            const created = { id: n.id, x: n.x, y: n.y, vx: 0, vy: 0, mass: 1 } satisfies Particle;
+            nudgeInsideBoundary(created, fieldConfig.targetRadius, fieldConfig.boundaryThickness);
+            particlesById.set(n.id, created);
+          } else {
+            p.x = Number.isFinite(p.x) ? p.x : n.x;
+            p.y = Number.isFinite(p.y) ? p.y : n.y;
+          }
         }
-      }
 
-      for (const id of [...particlesById.keys()]) {
-        if (!present.has(id)) {
-          particlesById.delete(id);
-          nodeMetaById.delete(id);
-          for (const key of [...semanticPairs.keys()]) {
-            if (key.startsWith(`${id}||`) || key.endsWith(`||${id}`)) {
-              semanticPairs.delete(key);
+        for (const id of [...particlesById.keys()]) {
+          if (!present.has(id)) {
+            particlesById.delete(id);
+            nodeMetaById.delete(id);
+            for (const key of [...semanticPairs.keys()]) {
+              if (key.startsWith(`${id}||`) || key.endsWith(`||${id}`)) {
+                semanticPairs.delete(key);
+              }
             }
           }
         }
-      }
 
-      // degrees
-      const degrees = new Map<string, number>();
-      for (const e of view.edges) {
-        degrees.set(e.source, (degrees.get(e.source) ?? 0) + 1);
-        degrees.set(e.target, (degrees.get(e.target) ?? 0) + 1);
-      }
+        let structuralEdges = view.edges;
+        if (enableStructuralEdgeHydration && openPlannerBaseUrl && view.nodes.length > 0) {
+          try {
+            const openPlannerEdges = await fetchOpenPlannerStructuralEdges({
+              openPlannerBaseUrl,
+              openPlannerApiKey,
+              nodeIds: view.nodes.map((node) => node.id),
+              limit: openPlannerStructuralEdgeLimit,
+            });
+            if (openPlannerEdges.length > 0) structuralEdges = openPlannerEdges;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[eros-eris] structural edge hydrate failed: ${message}`);
+          }
+        }
 
-      // structural springs
-      const nodeSet = new Set(view.nodes.map((n) => n.id));
-      springs = view.edges
-        .filter((e) => nodeSet.has(e.source) && nodeSet.has(e.target))
-        .map((e) => {
-          const prof = springProfile(e.kind);
-          return {
-            source: e.source,
-            target: e.target,
-            kind: e.kind,
-            strength: prof.strength * edgePullScale,
-            restLength: prof.restLength * edgeRestScale,
-          } satisfies SpringEdge;
-        });
+        const degrees = new Map<string, number>();
+        for (const e of structuralEdges) {
+          degrees.set(e.source, (degrees.get(e.source) ?? 0) + 1);
+          degrees.set(e.target, (degrees.get(e.target) ?? 0) + 1);
+        }
 
-      currentViewNodes = view.nodes;
-      currentDegrees = degrees;
-
-      // Persist ALL edges to OpenPlanner (layout-as-search-index)
-      if (openPlannerBaseUrl && view.edges.length > 0) {
-        try {
-          const edgeStart = Date.now();
-          const stored = await upsertOpenPlannerEdges({
-            openPlannerBaseUrl,
-            openPlannerApiKey,
-            edges: view.edges.map((e) => ({
+        const nodeSet = new Set(view.nodes.map((n) => n.id));
+        springs = structuralEdges
+          .filter((e) => nodeSet.has(e.source) && nodeSet.has(e.target))
+          .map((e) => {
+            const prof = springProfile(e.kind);
+            return {
               source: e.source,
               target: e.target,
               kind: e.kind,
-              data: e.dataJson ? JSON.parse(e.dataJson) : undefined,
-            })),
+              strength: prof.strength * edgePullScale,
+              restLength: prof.restLength * edgeRestScale,
+            } satisfies SpringEdge;
           });
-          if (stored > 0) {
-            // eslint-disable-next-line no-console
-            console.log(`[eros-eris] persisted ${stored} edges to openplanner edgeMs=${Date.now() - edgeStart}`);
+
+        if (antSystem) antSystem.updateGraph(springs);
+
+        currentViewNodes = view.nodes;
+        currentDegrees = degrees;
+
+        if (enableVisibleEmbeddingHydration && openPlannerBaseUrl && !hydrateInFlight) {
+          const visibleIds = view.nodes.map((n) => n.id).filter((id) => !embeddings.has(id));
+          if (visibleIds.length > 0) {
+            const idsToHydrate = visibleIds.slice(0, hydrateBatchSize * hydrateMaxBatchesPerRefresh);
+            hydrateInFlight = (async () => {
+              let fetched = 0;
+              let newlyCached = 0;
+              for (let i = 0; i < idsToHydrate.length; i += hydrateBatchSize) {
+                const chunkIds = idsToHydrate.slice(i, i + hydrateBatchSize);
+                const rows = await fetchOpenPlannerNodeEmbeddings({
+                  openPlannerBaseUrl,
+                  openPlannerApiKey,
+                  ids: chunkIds,
+                  eventIds: [],
+                  model: embeddingModel,
+                });
+                fetched += rows.length;
+                for (const row of rows) {
+                  if (!embeddings.has(row.id)) newlyCached += 1;
+                  embeddings.set(row.id, row.embedding);
+                }
+              }
+              if (fetched > 0) {
+                console.log(`[eros-eris] hydrated visible embeddings fetched=${fetched} newlyCached=${newlyCached} cached=${embeddings.size}/${view.nodes.length}`);
+              }
+            })()
+              .catch((error) => {
+                const message = error instanceof Error ? error.message : String(error);
+                console.warn(`[eros-eris] visible embedding hydrate failed: ${message}`);
+              })
+              .finally(() => {
+                hydrateInFlight = null;
+              });
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          // eslint-disable-next-line no-console
-          console.warn(`[eros-eris] edge persist failed: ${message}`);
         }
-      }
 
-      // eslint-disable-next-line no-console
-      console.log(
-        `[eros-eris] refresh viewNodes=${view.nodes.length}/${view.meta.totalNodes} viewEdges=${view.edges.length}/${view.meta.totalEdges} springs=${springs.length} fetchMs=${viewMs}`,
-      );
+        if (enableStructuralEdgeUpsert && openPlannerBaseUrl && view.edges.length > 0) {
+          try {
+            const edgeStart = Date.now();
+            const stored = await upsertOpenPlannerEdges({
+              openPlannerBaseUrl,
+              openPlannerApiKey,
+              edges: view.edges.map((e) => ({
+                source: e.source,
+                target: e.target,
+                kind: e.kind,
+                data: e.dataJson ? JSON.parse(e.dataJson) : undefined,
+              })),
+            });
+            if (stored > 0) {
+              console.log(`[eros-eris] persisted ${stored} edges to openplanner edgeMs=${Date.now() - edgeStart}`);
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[eros-eris] edge persist failed: ${message}`);
+          }
+        }
 
-      lastRefresh = now;
+        console.log(
+          `[eros-eris] refresh shard=${simShardIndex}/${simShardCount} cursor=${rotationCursor} used=${String((view.meta as Record<string, unknown>)?.rotationCursorUsed ?? rotationCursor)} viewNodes=${view.nodes.length}/${view.meta.totalNodes} viewEdges=${view.edges.length}/${view.meta.totalEdges} structuralEdges=${structuralEdges.length} springs=${springs.length} fetchMs=${viewMs}`,
+        );
+
+        if (enableCanonicalGraphRefresh && openPlannerBaseUrl && refreshStartedAt - lastCanonicalGraph >= canonicalGraphRefreshMs) {
+          try {
+            const canonicalStart = Date.now();
+            const canonicalEdges = await fetchCanonicalSemanticEdges({
+              openPlannerBaseUrl,
+              openPlannerApiKey,
+              nodeIds: present,
+            });
+            for (const e of canonicalEdges) {
+              const key = e.a < e.b ? `${e.a}||${e.b}` : `${e.b}||${e.a}`;
+              semanticPairs.set(key, e);
+            }
+            console.log(
+              `[eros-eris] canonical graph loaded canonicalEdges=${canonicalEdges.length} totalSemanticPairs=${semanticPairs.size} canonicalMs=${Date.now() - canonicalStart}`,
+            );
+            lastCanonicalGraph = Date.now();
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[eros-eris] canonical graph load failed: ${message}`);
+          }
+        }
+
+        lastRefresh = Date.now();
+        graphViewRefreshCount += 1;
+      })()
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[eros-eris] refresh failed: ${message}`);
+        })
+        .finally(() => {
+          refreshInFlight = null;
+        });
     }
 
     // --- queue embed candidates (non-blocking)
-    if (now - lastEmbed >= embedEveryMs && currentViewNodes.length > 0 && embedInFlight.size < embedMaxInFlight) {
+    if (enableSemanticPipeline && now - lastEmbed >= embedEveryMs && currentViewNodes.length > 0 && embedInFlight.size < embedMaxInFlight) {
       const candidates = pickEmbedCandidates({
         nodes: currentViewNodes,
         degrees: currentDegrees,
@@ -957,42 +1292,63 @@ async function main(): Promise<void> {
     // --- simulate one or more substeps
     const particles = [...particlesById.values()];
     const semantic = [...semanticPairs.values()];
-    for (let i = 0; i < simSubsteps; i += 1) {
-      stepField({ particles, dt: simDt, config: fieldConfig, springs, semantic });
-      applyLakeBands({ particles, nodesById: nodeMetaById, dt: simDt });
+    if (enableSimulation) {
+      if (antSystem) {
+        const trails = antSystem.tick();
+        antTrailEdges = trails.map((t) => ({
+          source: t.source,
+          target: t.target,
+          strength: t.strength,
+          restLength: t.restLength,
+        }));
+      }
+      const allSprings = [...springs, ...antTrailEdges];
+      for (let i = 0; i < simSubsteps; i += 1) {
+        stepField({ particles, dt: simDt, config: fieldConfig, springs: allSprings, semantic });
+        applyLakeBands({ particles, nodesById: nodeMetaById, dt: simDt });
+      }
     }
 
     // --- write positions back (slow, chunked)
-    if (now - lastWrite >= writeMs) {
+    if (enableLayoutWrites && particles.length > 0 && now - lastWrite >= writeMs && !writeInFlight) {
       const inputs = particles.map((p) => ({ id: p.id, x: p.x, y: p.y }));
-      const writeStart = Date.now();
-      try {
-        let total = 0;
-        for (let i = 0; i < inputs.length; i += writeChunk) {
-          const chunk = inputs.slice(i, i + writeChunk);
-          const n = await layoutUpsertPositions({ graphqlUrl, adminToken, inputs: chunk });
-          total += n;
-          if (writePauseMs > 0) await sleep(writePauseMs);
+      const semanticCount = semantic.length;
+      const springCount = springs.length;
+      writeInFlight = (async () => {
+        const writeStart = Date.now();
+        try {
+          let total = 0;
+          try {
+            total = await layoutUpsertPositions({ graphqlUrl, adminToken, inputs });
+          } catch {
+            for (let i = 0; i < inputs.length; i += writeChunk) {
+              const chunk = inputs.slice(i, i + writeChunk);
+              const n = await layoutUpsertPositions({ graphqlUrl, adminToken, inputs: chunk });
+              total += n;
+              if (writePauseMs > 0) await sleep(writePauseMs);
+            }
+          }
+          const stats = summarizeField({
+            particles,
+            targetRadius: fieldConfig.targetRadius,
+            boundaryThickness: fieldConfig.boundaryThickness,
+          });
+          const antStats = antSystem ? antSystem.stats() : null;
+          console.log(
+            `[eros-eris] wrote positions: ${total} nodes · radius p50=${stats.p50.toFixed(0)} p90=${stats.p90.toFixed(0)} p99=${stats.p99.toFixed(0)} max=${stats.max.toFixed(0)} mean=${stats.mean.toFixed(0)} edgeBand=${(stats.edgeBandFraction * 100).toFixed(1)}% semanticPairs=${semanticCount} springs=${springCount}${antStats ? ` ants=${antStats.antCount} antEdges=${antStats.edgeCount} avgPh=${antStats.avgPheromone.toFixed(2)}` : ""} writeMs=${Date.now() - writeStart}`,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[eros-eris] layout write failed: ${message}`);
         }
-        const stats = summarizeField({
-          particles,
-          targetRadius: fieldConfig.targetRadius,
-          boundaryThickness: fieldConfig.boundaryThickness,
-        });
-        // eslint-disable-next-line no-console
-        console.log(
-          `[eros-eris] wrote positions: ${total} nodes · radius p50=${stats.p50.toFixed(0)} p90=${stats.p90.toFixed(0)} p99=${stats.p99.toFixed(0)} max=${stats.max.toFixed(0)} mean=${stats.mean.toFixed(0)} edgeBand=${(stats.edgeBandFraction * 100).toFixed(1)}% semanticPairs=${semantic.length} springs=${springs.length} writeMs=${Date.now() - writeStart}`,
-        );
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        // eslint-disable-next-line no-console
-        console.warn(`[eros-eris] layout write failed: ${message}`);
-      }
-      lastWrite = now;
+        lastWrite = Date.now();
+      })().finally(() => {
+        writeInFlight = null;
+      });
     }
 
     // Yield to event loop briefly so background promises can progress
-    await sleep(Math.min(stepMs, 10));
+    await sleep(Math.min(stepMs, 1));
   }
 }
 

@@ -16,6 +16,14 @@ services:
       OLLAMA_URL: "http://127.0.0.1:11434"
       OLLAMA_MODEL: "qwen3-embedding:0.6b"
 
+      # Optional cosine offload via vexx.
+      # VEXX_BASE_URL: "http://127.0.0.1:8788"
+      # VEXX_API_KEY: "..."
+      VEXX_DEVICE: "AUTO"
+      VEXX_REQUIRE_ACCEL: "false"
+      VEXX_MIN_CANDIDATES: "64"
+      VEXX_TIMEOUT_MS: "30000"
+
       SIM_MAX_NODES: "6000"
       SIM_MAX_EDGES: "12000"
       SIM_STEP_MS: "5000"
